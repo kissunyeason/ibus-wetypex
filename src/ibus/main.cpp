@@ -144,6 +144,10 @@ struct EngineState {
   bool voiceChordDown = false;
   guint voiceChordSource = 0;
   bool voiceHandsFree = false;
+  // 长按空格语音：Ctrl+空格被桌面环境/IBus 抢占时的兜底，短按仍是普通空格。
+  bool voiceSpaceDown = false;
+  guint voiceSpaceSource = 0;
+  guint voiceSpaceKeycode = 0;
   bool selectionPending = false;
   bool renderedPreeditVisible = false;
   bool renderedPreeditInitialized = false;
@@ -892,8 +896,13 @@ static void clearVoice(EngineState *state) {
     g_source_remove(state->voiceChordSource);
     state->voiceChordSource = 0;
   }
+  if (state->voiceSpaceSource) {
+    g_source_remove(state->voiceSpaceSource);
+    state->voiceSpaceSource = 0;
+  }
   state->voiceChordDown = false;
   state->voiceHandsFree = false;
+  state->voiceSpaceDown = false;
   state->voiceActive = false;
   state->voiceFinishing = false;
   state->voiceToken.clear();
@@ -992,6 +1001,33 @@ static gboolean voiceTick(gpointer data) {
   return TRUE;
 }
 
+// 长按空格越过阈值才启动语音，避免把普通打空格变成录音。
+static gboolean voiceSpaceHold(gpointer data) {
+  auto *state = static_cast<EngineState *>(data);
+  state->voiceSpaceSource = 0;
+  if (!state->voiceSpaceDown || !state->preedit.empty() || !state->candidates.empty() ||
+      state->english || !state->active)
+    return FALSE;
+  startVoice(state);
+  if (state->voiceActive)
+    voiceAux(state, "🎤 语音输入中…（松手结束）");
+  return FALSE;
+}
+
+// 短按：把被吞掉的 keydown/keyup 成对转发回应用，等价于一个普通空格。
+static void forwardPlainSpace(IBusEngine *engine, guint keycode) {
+  ibus_engine_forward_key_event(engine, IBUS_KEY_space, keycode, 0);
+  ibus_engine_forward_key_event(engine, IBUS_KEY_space, keycode, IBUS_RELEASE_MASK);
+}
+
+static void finishVoiceSpace(EngineState *state) {
+  if (state->voiceActive && !state->voiceFinishing) {
+    state->voiceFinishing = true;
+    spawnVoiceControl({"finish", state->voiceToken});
+    voiceAux(state, "🎤 识别中…");
+  }
+}
+
 // 按住 Ctrl+空格：按下即开始录音（不丢语音开头）。200 ms 内松手视为短按，
 // 转为免提模式；超过 200 ms 则松手即结束（Windows「按住说话」）。
 static gboolean voiceChordHold(gpointer data) {
@@ -1070,6 +1106,36 @@ gboolean onProcessKey(IBusEngine *engine, guint keyval, guint keycode, guint mod
   }
   // ---- Ctrl+空格语音输入结束 ----
 
+  // ---- 长按空格语音（兜底）----
+  // IBus 默认把 Ctrl+空格注册为「启用/禁用输入法」全局热键，部分桌面会抢走
+  // 整个组合键导致引擎收不到；此时按住空格 ≥160 ms 仍可语音，短按是普通空格。
+  const guint spaceMods =
+      cleanModifiers & ~(IBUS_LOCK_MASK | IBUS_MOD2_MASK | IBUS_HANDLED_MASK | IBUS_IGNORED_MASK);
+  if (keyval == IBUS_KEY_space && spaceMods == 0 && !state->voiceChordDown &&
+      !state->voiceHandsFree && !state->voiceActive && state->active && !state->english &&
+      state->preedit.empty() && state->candidates.empty() && !state->selectionPending) {
+    if (release) {
+      if (!state->voiceSpaceDown)
+        return FALSE;
+      state->voiceSpaceDown = false;
+      if (state->voiceSpaceSource) {
+        g_source_remove(state->voiceSpaceSource);
+        state->voiceSpaceSource = 0;
+        forwardPlainSpace(engine, state->voiceSpaceKeycode);
+        return TRUE;
+      }
+      finishVoiceSpace(state);
+      return TRUE;
+    }
+    if (state->voiceSpaceDown)
+      return TRUE;  // 忽略按键重复
+    state->voiceSpaceDown = true;
+    state->voiceSpaceKeycode = keycode;
+    state->voiceSpaceSource = g_timeout_add(160, voiceSpaceHold, state);
+    return TRUE;
+  }
+  // ---- 长按空格语音结束 ----
+
   // 语音输入开关：Ctrl+Alt+V。必须放在 isCommandModifier 之前，
   // 否则带修饰键的组合会被当作命令键直接放行给应用。
   if ((keyval == IBUS_KEY_v || keyval == IBUS_KEY_V) &&
@@ -1141,6 +1207,29 @@ gboolean onProcessKey(IBusEngine *engine, guint keyval, guint keycode, guint mod
   if (release)
     return FALSE;
 
+  // 候选翻页：- / = 与 PageUp/PageDown 等价。
+  // 放在「拼音串非空」分支之外，云候选等 preedit 为空的场景同样能翻页；
+  // 有候选时一律吞掉这两个键，翻到边界也不放行，避免 "=" 直接上屏成等号；
+  // 没有候选时 - / = 仍作为普通字符输入。
+  const bool pagePrev = keyval == IBUS_KEY_Page_Up || keyval == IBUS_KEY_minus;
+  const bool pageNext = keyval == IBUS_KEY_Page_Down || keyval == IBUS_KEY_equal;
+  if (pagePrev || pageNext) {
+    if (!state->candidates.empty()) {
+      const int pageCount = static_cast<int>(
+          (state->candidates.size() + state->settings.pageSize - 1) / state->settings.pageSize);
+      const int nextPage = std::clamp(state->candidatePage + (pageNext ? 1 : -1), 0,
+                                      std::max(1, pageCount) - 1);
+      if (nextPage != state->candidatePage) {
+        state->candidatePage = nextPage;
+        state->candidateCursor = state->candidatePage * state->settings.pageSize;
+        updateUi(state);
+      }
+      return TRUE;
+    }
+    if (keyval == IBUS_KEY_Page_Up || keyval == IBUS_KEY_Page_Down)
+      return TRUE;
+  }
+
   if (!state->preedit.empty()) {
     if (keyval == IBUS_KEY_Escape) {
       resetComposition(state, true);
@@ -1210,26 +1299,6 @@ gboolean onProcessKey(IBusEngine *engine, guint keyval, guint keycode, guint mod
     if (keyval == IBUS_KEY_End) {
       updateCursor(state, state->preedit.size());
       return TRUE;
-    }
-
-    // 候选翻页：PageUp/PageDown 以及 - / =。翻不动时 - / = 放行为普通字符。
-    const bool pagePrev = keyval == IBUS_KEY_Page_Up || keyval == IBUS_KEY_minus;
-    const bool pageNext = keyval == IBUS_KEY_Page_Down || keyval == IBUS_KEY_equal;
-    if (pagePrev || pageNext) {
-      const int pageCount =
-          static_cast<int>((state->candidates.size() + state->settings.pageSize - 1) / state->settings.pageSize);
-      if (pageCount > 1) {
-        const int nextPage =
-            std::clamp(state->candidatePage + (pageNext ? 1 : -1), 0, pageCount - 1);
-        if (nextPage != state->candidatePage) {
-          state->candidatePage = nextPage;
-          state->candidateCursor = state->candidatePage * state->settings.pageSize;
-          updateUi(state);
-          return TRUE;
-        }
-      }
-      if (keyval == IBUS_KEY_Page_Up || keyval == IBUS_KEY_Page_Down)
-        return TRUE;
     }
 
     if (keyval == IBUS_KEY_Up || keyval == IBUS_KEY_Down) {
