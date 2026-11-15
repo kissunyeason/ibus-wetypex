@@ -64,10 +64,13 @@ jobs:
 
           Name:           ibus-wetypex
           Version:        ${version}
-          Release:        1%{?dist}
+          Release:        4%{?dist}
           Summary:        WeTypeX IBus input method
           License:        MIT
           BuildArch:      x86_64
+          Requires:       python3
+          Requires:       bubblewrap
+          Requires:       pipewire-utils
 
           %description
           WeTypeX IBus input method for Fedora Linux.
@@ -87,7 +90,7 @@ jobs:
           /usr/share/*
 
           %changelog
-          * $(LC_ALL=C date '+%a %b %d %Y') WeTypeX CI <noreply@example.com> - ${version}-1
+          * $(LC_ALL=C date '+%a %b %d %Y') WeTypeX CI <noreply@example.com> - ${version}-4
           - Initial Fedora package
           EOF
 
