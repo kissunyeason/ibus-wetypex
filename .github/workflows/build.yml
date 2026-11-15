@@ -152,7 +152,7 @@ jobs:
 
           Name:           ibus-wetypex
           Version:        ${version}
-          Release:        4%{?dist}
+          Release:        5%{?dist}
           Summary:        WeTypeX IBus input method
           License:        MIT
           BuildArch:      x86_64

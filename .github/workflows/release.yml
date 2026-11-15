@@ -64,7 +64,7 @@ jobs:
 
           Name:           ibus-wetypex
           Version:        ${version}
-          Release:        4%{?dist}
+          Release:        5%{?dist}
           Summary:        WeTypeX IBus input method
           License:        MIT
           BuildArch:      x86_64
@@ -90,7 +90,7 @@ jobs:
           /usr/share/*
 
           %changelog
-          * $(LC_ALL=C date '+%a %b %d %Y') WeTypeX CI <noreply@example.com> - ${version}-4
+          * $(LC_ALL=C date '+%a %b %d %Y') WeTypeX CI <noreply@example.com> - ${version}-5
           - Initial Fedora package
           EOF
 
