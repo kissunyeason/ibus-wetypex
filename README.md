@@ -227,6 +227,8 @@ wetypex-account sync-now     # 请求个人词库与常用语同步
 
 闭源输入核心的私有词库格式与 Rime 的 `*.userdb/` 不通用；设置窗口里的「个人词库同步」是微信账号设备间云同步，无法直接导入。用 `tools/dict-sync/` 下的脚本转换：
 
+> 脚本位于源码仓库 `tools/dict-sync/`，不随 RPM 安装；clone 本仓库或从仓库单独下载这三个文件即可。
+
 ```bash
 sh tools/dict-sync/sync-dict.sh                          # 预览，不写任何文件
 sh tools/dict-sync/sync-dict.sh --apply                  # 导入 dynamic-phrases.txt
