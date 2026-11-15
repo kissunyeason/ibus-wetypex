@@ -11,9 +11,13 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <map>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -112,6 +116,7 @@ struct EngineState {
   size_t renderedCursor = 0;
   std::vector<std::string> candidates;
   std::vector<bool> cloud;
+  int dynamicCount = 0;  // 本次回包前置插入的动态候选条数（引擎不知道这些 index）
   std::vector<DeferredKey> deferredKeys;
   IBusPropList *properties = nullptr;
   IBusProperty *modeProperty = nullptr;
@@ -250,6 +255,312 @@ guint utf8Cursor(const std::string &text, size_t bytePosition) {
   bytePosition = std::min(bytePosition, text.size());
   return static_cast<guint>(g_utf8_pointer_to_offset(text.c_str(), text.c_str() + bytePosition));
 }
+
+// ---- 动态候选（对齐 rime-ice 的 Lua translator）--------------------------
+// 微信输入法的候选只能由闭源引擎返回，IBus 前端没有 translator 扩展点。
+// 这里在引擎回包后把「实时算出来的候选」前置插入候选表，选中时前端直接上屏。
+// 农历数据来自 GPL 项目 lunar / python-lunardate 的 yearInfos 编码表
+// （1900-2099，起点 1900-01-31 = 农历 1900 年正月初一），由脚本从库源码
+// 自动提取，未手工录入或推算。编码：低 4 位=闰月(0=无)，bit16=闰月大小，
+// bit(16-月)=该月大小（1=30 天，0=29 天）。
+struct LunarDate {
+  int year = 1900;
+  int month = 1;
+  int day = 1;
+  bool leap = false;
+};
+
+static const uint32_t kLunarInfo[] = {
+    0x04bd8, 0x04ae0, 0x0a570, 0x054d5, 0x0d260,
+    0x0d950, 0x16554, 0x056a0, 0x09ad0, 0x055d2,
+    0x04ae0, 0x0a5b6, 0x0a4d0, 0x0d250, 0x1d255,
+    0x0b540, 0x0d6a0, 0x0ada2, 0x095b0, 0x14977,
+    0x04970, 0x0a4b0, 0x0b4b5, 0x06a50, 0x06d40,
+    0x1ab54, 0x02b60, 0x09570, 0x052f2, 0x04970,
+    0x06566, 0x0d4a0, 0x0ea50, 0x06e95, 0x05ad0,
+    0x02b60, 0x186e3, 0x092e0, 0x1c8d7, 0x0c950,
+    0x0d4a0, 0x1d8a6, 0x0b550, 0x056a0, 0x1a5b4,
+    0x025d0, 0x092d0, 0x0d2b2, 0x0a950, 0x0b557,
+    0x06ca0, 0x0b550, 0x15355, 0x04da0, 0x0a5d0,
+    0x14573, 0x052b0, 0x0a9a8, 0x0e950, 0x06aa0,
+    0x0aea6, 0x0ab50, 0x04b60, 0x0aae4, 0x0a570,
+    0x05260, 0x0f263, 0x0d950, 0x05b57, 0x056a0,
+    0x096d0, 0x04dd5, 0x04ad0, 0x0a4d0, 0x0d4d4,
+    0x0d250, 0x0d558, 0x0b540, 0x0b5a0, 0x195a6,
+    0x095b0, 0x049b0, 0x0a974, 0x0a4b0, 0x0b27a,
+    0x06a50, 0x06d40, 0x0af46, 0x0ab60, 0x09570,
+    0x04af5, 0x04970, 0x064b0, 0x074a3, 0x0ea50,
+    0x06b58, 0x05ac0, 0x0ab60, 0x096d5, 0x092e0,
+    0x0c960, 0x0d954, 0x0d4a0, 0x0da50, 0x07552,
+    0x056a0, 0x0abb7, 0x025d0, 0x092d0, 0x0cab5,
+    0x0a950, 0x0b4a0, 0x0baa4, 0x0ad50, 0x055d9,
+    0x04ba0, 0x0a5b0, 0x15176, 0x052b0, 0x0a930,
+    0x07954, 0x06aa0, 0x0ad50, 0x05b52, 0x04b60,
+    0x0a6e6, 0x0a4e0, 0x0d260, 0x0ea65, 0x0d530,
+    0x05aa0, 0x076a3, 0x096d0, 0x04afb, 0x04ad0,
+    0x0a4d0, 0x1d0b6, 0x0d250, 0x0d520, 0x0dd45,
+    0x0b5a0, 0x056d0, 0x055b2, 0x049b0, 0x0a577,
+    0x0a4b0, 0x0aa50, 0x1b255, 0x06d20, 0x0ada0,
+    0x14b63, 0x09370, 0x049f8, 0x04970, 0x064b0,
+    0x168a6, 0x0ea50, 0x06aa0, 0x1a6c4, 0x0aae0,
+    0x092e0, 0x0d2e3, 0x0c960, 0x0d557, 0x0d4a0,
+    0x0da50, 0x05d55, 0x056a0, 0x0a6d0, 0x055d4,
+    0x052d0, 0x0a9b8, 0x0a950, 0x0b4a0, 0x0b6a6,
+    0x0ad50, 0x055a0, 0x0aba4, 0x0a5b0, 0x052b0,
+    0x0b273, 0x06930, 0x07337, 0x06aa0, 0x0ad50,
+    0x14b55, 0x04b60, 0x0a570, 0x054e4, 0x0d160,
+    0x0e968, 0x0d520, 0x0daa0, 0x16aa6, 0x056d0,
+    0x04ae0, 0x0a9d4, 0x0a2d0, 0x0d150, 0x0f252,
+};
+
+static int lunarYearDays(uint32_t info) {
+  int res = 29 * 12;
+  const bool leap = (info % 16) != 0;
+  if (leap)
+    res += 29;
+  uint32_t x = info / 16;
+  for (int i = 0, n = 12 + (leap ? 1 : 0); i < n; ++i, x /= 2)
+    if (x % 2 == 1)
+      ++res;
+  return res;
+}
+
+// 公历日期 -> 距 1970-01-01 的天数（Howard Hinnant days_from_civil）
+static int64_t daysFromCivil(int y, int m, int d) {
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = static_cast<unsigned>(y - era * 400);
+  const unsigned mp = static_cast<unsigned>(m + (m > 2 ? -3 : 9));
+  const unsigned doy = (153 * mp + 2) / 5 + static_cast<unsigned>(d) - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return static_cast<int64_t>(era) * 146097 + static_cast<int>(doe) - 719468;
+}
+
+static LunarDate solarToLunar(int y, int m, int d) {
+  int64_t off = daysFromCivil(y, m, d) - daysFromCivil(1900, 1, 31);
+  const int count = static_cast<int>(sizeof(kLunarInfo) / sizeof(kLunarInfo[0]));
+  int idx = 0;
+  while (idx < count) {
+    const int yd = lunarYearDays(kLunarInfo[idx]);
+    if (off < yd)
+      break;
+    off -= yd;
+    ++idx;
+  }
+  if (idx >= count || off < 0)
+    return {};
+  const uint32_t info = kLunarInfo[idx];
+  const int leapMonth = static_cast<int>(info % 16);
+  for (int month = 1; month <= 12; ++month) {
+    const int days = 29 + static_cast<int>((info >> (16 - month)) & 1u);
+    if (off < days)
+      return {1900 + idx, month, static_cast<int>(off) + 1, false};
+    off -= days;
+    if (leapMonth != 0 && month == leapMonth) {
+      const int leapDays = 29 + static_cast<int>((info >> 16) & 1u);
+      if (off < leapDays)
+        return {1900 + idx, month, static_cast<int>(off) + 1, true};
+      off -= leapDays;
+    }
+  }
+  return {};
+}
+
+static const char *kCnNum[] = {"零", "一", "二", "三", "四", "五",
+                              "六", "七", "八", "九", "十"};
+static const char *kLunarMonth[] = {"正月", "二月", "三月", "四月", "五月", "六月",
+                                   "七月", "八月", "九月", "十月", "冬月", "腊月"};
+static const char *kGan[] = {"甲", "乙", "丙", "丁", "戊", "己", "庚", "辛", "壬", "癸"};
+static const char *kZhi[] = {"子", "丑", "寅", "卯", "辰", "巳",
+                            "午", "未", "申", "酉", "戌", "亥"};
+static const char *kAnimal[] = {"鼠", "牛", "虎", "兔", "龙", "蛇",
+                               "马", "羊", "猴", "鸡", "狗", "猪"};
+static const char *kWeekCn[] = {"星期日", "星期一", "星期二", "星期三",
+                               "星期四", "星期五", "星期六"};
+static const char *kWeekShort[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+
+static std::string lunarDayName(int d) {
+  if (d == 10) return "初十";
+  if (d < 10) return std::string("初") + kCnNum[d];
+  if (d == 20) return "二十";
+  if (d == 30) return "三十";
+  if (d < 20) return std::string("十") + kCnNum[d - 10];
+  return std::string("廿") + kCnNum[d - 20];
+}
+
+static std::string twoDigits(int v) {
+  char b[8];
+  std::snprintf(b, sizeof b, "%02d", v);
+  return b;
+}
+
+static std::vector<std::string> dateCandidates(const std::tm &t) {
+  const int y = t.tm_year + 1900, m = t.tm_mon + 1, d = t.tm_mday;
+  const std::string Y = std::to_string(y), M = twoDigits(m), D = twoDigits(d);
+  const std::string cn = std::to_string(m) + "月" + std::to_string(d) + "日";
+  return {Y + "-" + M + "-" + D,
+          Y + "/" + M + "/" + D,
+          Y + "." + M + "." + D,
+          Y + M + D,
+          Y + "年" + cn,
+          cn,
+          Y + "年" + cn + " " + kWeekCn[t.tm_wday]};
+}
+
+static std::vector<std::string> timeCandidates(const std::tm &t) {
+  char hm[16], hms[16];
+  std::snprintf(hm, sizeof hm, "%02d:%02d", t.tm_hour, t.tm_min);
+  std::snprintf(hms, sizeof hms, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+  const std::string half = t.tm_hour < 12 ? "上午" : "下午";
+  return {hm, hms,
+          std::to_string(t.tm_hour) + "时" + std::to_string(t.tm_min) + "分" +
+              std::to_string(t.tm_sec) + "秒",
+          half + hm};
+}
+
+static std::vector<std::string> weekCandidates(const std::tm &t) {
+  char iso[8] = {};
+  std::strftime(iso, sizeof iso, "%V", &t);
+  return {kWeekCn[t.tm_wday], kWeekShort[t.tm_wday],
+          std::to_string(t.tm_year + 1900) + "年第" + std::to_string(std::atoi(iso)) + "周"};
+}
+
+static std::vector<std::string> lunarCandidates(const std::tm &t) {
+  const LunarDate l = solarToLunar(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
+  if (l.year < 1900 || l.month < 1 || l.month > 12)
+    return {};
+  const int g = ((l.year - 4) % 10 + 10) % 10;
+  const int z = ((l.year - 4) % 12 + 12) % 12;
+  const std::string ganzhi = std::string(kGan[g]) + kZhi[z];
+  const std::string body = (l.leap ? "闰" : "") + std::string(kLunarMonth[l.month - 1]) +
+                           lunarDayName(l.day);
+  return {ganzhi + kAnimal[z] + "年" + body,
+          "农历" + ganzhi + "年" + body,
+          ganzhi + "年" + body + "（" + kWeekCn[t.tm_wday] + "）"};
+}
+
+// 简单四则运算：输入 "=1+2*3" 得到 7
+static double calcSum(const char *&p);
+static void skipCalcSpaces(const char *&p) {
+  while (*p == ' ') ++p;
+}
+static double calcAtom(const char *&p) {
+  skipCalcSpaces(p);
+  if (*p == '(') {
+    ++p;
+    const double v = calcSum(p);
+    skipCalcSpaces(p);
+    if (*p == ')') ++p;
+    else return NAN;
+    return v;
+  }
+  if (*p == '-') { ++p; return -calcAtom(p); }
+  if (*p == '+') { ++p; return calcAtom(p); }
+  if (!((*p >= '0' && *p <= '9') || *p == '.')) return NAN;
+  char *end = nullptr;
+  const double v = std::strtod(p, &end);
+  p = end;
+  return v;
+}
+static double calcTerm(const char *&p) {
+  double v = calcAtom(p);
+  for (;;) {
+    skipCalcSpaces(p);
+    if (*p != '*' && *p != '/') break;
+    const char op = *p++;
+    const double r = calcAtom(p);
+    if (std::isnan(r) || (op == '/' && r == 0)) return NAN;
+    v = op == '*' ? v * r : v / r;
+  }
+  return v;
+}
+static double calcSum(const char *&p) {
+  double v = calcTerm(p);
+  for (;;) {
+    skipCalcSpaces(p);
+    if (*p != '+' && *p != '-') break;
+    const char op = *p++;
+    const double r = calcTerm(p);
+    if (std::isnan(r)) return NAN;
+    v = op == '+' ? v + r : v - r;
+  }
+  return v;
+}
+static std::vector<std::string> calcCandidates(const std::string &expr) {
+  for (char c : expr)
+    if (!((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '*' || c == '/' ||
+          c == '(' || c == ')' || c == '.' || c == ' '))
+      return {};
+  const char *p = expr.c_str();
+  const double v = calcSum(p);
+  skipCalcSpaces(p);
+  if (*p != '\0' || std::isnan(v)) return {};
+  char buf[64];
+  if (v == static_cast<double>(static_cast<long long>(v)))
+    std::snprintf(buf, sizeof buf, "%lld", static_cast<long long>(v));
+  else
+    std::snprintf(buf, sizeof buf, "%.10g", v);
+  return {buf};
+}
+
+// 自定义短语：~/.config/wetypex/dynamic-phrases.txt，每行「编码<TAB>文本」，
+// # 开头为注释。等价于雾凇的快捷短语，10 秒热重载，不用重启输入法。
+static const std::map<std::string, std::string> &customPhrases() {
+  static std::map<std::string, std::string> cache;
+  static std::time_t lastCheck = 0;
+  const std::time_t now = std::time(nullptr);
+  if (now - lastCheck < 10) return cache;
+  lastCheck = now;
+  const auto path = std::filesystem::path(g_get_user_config_dir()) / "wetypex" /
+                    "dynamic-phrases.txt";
+  std::map<std::string, std::string> fresh;
+  std::ifstream f(path);
+  std::string line;
+  while (std::getline(f, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    const auto tab = line.find('\t');
+    if (tab == std::string::npos) continue;
+    const std::string code = line.substr(0, tab);
+    const std::string text = line.substr(tab + 1);
+    if (!code.empty() && !text.empty()) fresh[code] = text;
+  }
+  cache = std::move(fresh);
+  return cache;
+}
+
+static std::string normalizeCode(const std::string &s) {
+  std::string out;
+  out.reserve(s.size());
+  for (unsigned char c : s) {
+    if (c == '\'' || c == ' ' || c == '\t') continue;
+    out.push_back(static_cast<char>(c));
+  }
+  return out;
+}
+static bool isAsciiCode(const std::string &s) {
+  for (unsigned char c : s)
+    if (c >= 0x80) return false;
+  return true;
+}
+
+static std::vector<std::string> dynamicCandidatesFor(const std::string &code) {
+  if (code.empty()) return {};
+  {
+    const auto &phrases = customPhrases();
+    const auto it = phrases.find(code);
+    if (it != phrases.end()) return {it->second};
+  }
+  if (code[0] == '=') return calcCandidates(code.substr(1));
+  const std::time_t now = std::time(nullptr);
+  std::tm local{};
+  localtime_r(&now, &local);
+  if (code == "rq" || code == "date") return dateCandidates(local);
+  if (code == "nl" || code == "lunar") return lunarCandidates(local);
+  if (code == "sj" || code == "time") return timeCandidates(local);
+  if (code == "xq" || code == "week") return weekCandidates(local);
+  return {};
+}
+// ---- 动态候选结束 -------------------------------------------------------
 
 void updateUi(EngineState *state) {
   auto *engine = IBUS_ENGINE(state->owner);
@@ -575,6 +886,7 @@ void processResponse(EngineState *state, const std::string &line) {
       std::min<size_t>(std::max<int64_t>(0, wire::number(json.get(), "display_cursor")), state->displayPreedit.size());
   state->revision = static_cast<uint64_t>(wire::number(json.get(), "revision"));
   state->candidates.clear();
+  state->dynamicCount = 0;
   state->cloud.clear();
   auto *candidates = wire::get(json.get(), "candidates");
   auto *cloud = wire::get(json.get(), "cloud");
@@ -591,11 +903,25 @@ void processResponse(EngineState *state, const std::string &line) {
       state->cloud.push_back(cloudFlag && json_object_get_boolean(cloudFlag));
     }
   }
+  // 动态候选：引擎回包后前置插入实时生成的候选，索引 0..dynamicCount-1。
+  state->dynamicCount = 0;
+  {
+    const std::string dynCode = normalizeCode(state->preedit);
+    const auto dyn = isAsciiCode(dynCode) ? dynamicCandidatesFor(dynCode)
+                                          : std::vector<std::string>{};
+    if (!dyn.empty()) {
+      state->candidates.insert(state->candidates.begin(), dyn.begin(), dyn.end());
+      state->cloud.insert(state->cloud.begin(), dyn.size(), false);
+      state->dynamicCount = static_cast<int>(dyn.size());
+    }
+  }
   if (state->candidates.empty()) {
     state->candidatePage = 0;
     state->candidateCursor = 0;
   } else {
-    state->candidateCursor = std::clamp(state->candidateCursor, 0, static_cast<int>(state->candidates.size()) - 1);
+    state->candidateCursor = state->dynamicCount > 0
+        ? 0
+        : std::clamp(state->candidateCursor, 0, static_cast<int>(state->candidates.size()) - 1);
     state->candidatePage = state->candidateCursor / state->settings.pageSize;
   }
   updateUi(state);
@@ -613,6 +939,7 @@ void resetComposition(EngineState *state, bool sendReset) {
   state->editableBegin = 0;
   state->displayCursor = 0;
   state->candidates.clear();
+  state->dynamicCount = 0;
   state->cloud.clear();
   state->candidatePage = 0;
   state->candidateCursor = 0;
@@ -694,6 +1021,7 @@ void setEnglishMode(EngineState *state, bool english) {
   state->shiftCandidate = false;
   state->shiftWasUsed = false;
   state->candidates.clear();
+  state->dynamicCount = 0;
   state->cloud.clear();
   updateUi(state);
 }
@@ -818,20 +1146,34 @@ bool processPunctuation(EngineState *state, gunichar unicode) {
 void selectCandidate(EngineState *state, int index, bool pageRelative = false) {
   if (state->preedit.empty())
     return;
-  const bool hasCurrentCandidates = state->inputSequence <= state->applied && !state->candidates.empty();
   int globalIndex = index;
   if (index < 0)
     globalIndex = state->candidateCursor;
   else if (pageRelative)
     globalIndex += state->candidatePage * state->settings.pageSize;
-  if (hasCurrentCandidates && (globalIndex < 0 || globalIndex >= static_cast<int>(state->candidates.size())))
+
+  // 动态候选由前端生成，引擎不知道这些 index：直接上屏并重置组合。
+  if (state->dynamicCount > 0 && globalIndex >= 0 && globalIndex < state->dynamicCount) {
+    const std::string text = state->candidates[globalIndex];
+    ibus_engine_commit_text(IBUS_ENGINE(state->owner),
+                            ibus_text_new_from_string(text.c_str()));
+    resetComposition(state, true);
+    return;
+  }
+
+  const bool hasCurrentCandidates = state->inputSequence <= state->applied && !state->candidates.empty();
+  // 引擎候选索引要扣掉前面插入的动态候选，否则会选错词。
+  const int engineIndex = globalIndex - state->dynamicCount;
+  if (hasCurrentCandidates &&
+      (engineIndex < 0 || globalIndex >= static_cast<int>(state->candidates.size())))
     return;
   const int64_t expected = hasCurrentCandidates ? static_cast<int64_t>(state->revision) : -1;
-  if (!sendRequest(state, "select", "", std::max(0, globalIndex), expected))
+  if (!sendRequest(state, "select", "", std::max(0, engineIndex), expected))
     return;
   state->selectionPending = true;
   state->candidateCursor = std::max(0, globalIndex);
   state->candidates.clear();
+  state->dynamicCount = 0;
   state->cloud.clear();
   updateUi(state);
 }
@@ -1264,6 +1606,7 @@ gboolean onProcessKey(IBusEngine *engine, guint keyval, guint keycode, guint mod
     ++state->cursor;
     state->displayPreedit.clear();
     state->candidates.clear();
+  state->dynamicCount = 0;
     state->cloud.clear();
     state->candidatePage = state->candidateCursor = 0;
     sendRequest(state, "key", text);
