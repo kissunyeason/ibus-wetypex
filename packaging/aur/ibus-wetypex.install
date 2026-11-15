@@ -1,0 +1,35 @@
+post_install() {
+    cat <<'EOF'
+
+WeTypeX 已安装。首次使用请依次执行：
+
+  1. 准备官方运行时（二选一）：
+     wetypex-setup --download --accept-upstream-license
+     wetypex-setup --archive /path/to/WeType_2.2.3_657.zip
+
+  2. 检查输入核心：
+     wetypex-setup --check
+
+  3. 打开「设置 → 键盘」，将 WeTypeX 添加到当前输入法列表。
+
+  4. 重启 IBus：
+     ibus restart
+
+完整说明：https://github.com/chencaidy/ibus-wetypex#首次设置
+EOF
+}
+
+post_upgrade() {
+    cat <<'EOF'
+
+WeTypeX 已升级。请重启 IBus 以加载新版本：
+
+  ibus restart
+
+如输入核心不可用，请运行：
+
+  wetypex-setup --check
+
+如果检查报告运行时文件缺失，请重新执行首次安装时的运行时准备命令。
+EOF
+}

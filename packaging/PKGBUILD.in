@@ -1,0 +1,34 @@
+pkgname=ibus-wetypex
+pkgver=3.0.1.684
+pkgrel=1
+pkgdesc='WeTypeX native Linux input method for IBus'
+url='https://github.com/chencaidy/ibus-wetypex'
+arch=('x86_64')
+license=('MIT' 'ISC' 'BSD-2-Clause' 'curl')
+options=('!debug')
+depends=('ibus' 'gtk4' 'libadwaita' 'libc++' 'json-c' 'curl' 'openssl' 'bubblewrap' 'util-linux' 'python' 'python-fonttools' 'python-pillow' 'fontconfig' 'pipewire' 'ffmpeg' 'libnotify' 'polkit')
+makedepends=('cmake' 'clang' 'git' 'boost' 'openssl')
+install=ibus-wetypex.install
+source=("ibus-wetypex-${pkgver}.tar.gz"
+        'https://curl.se/download/curl-8.22.0.tar.xz'
+        'libkqueue::git+https://github.com/mheily/libkqueue.git#commit=46a3e130f88b0b0742575dcb01d77e336538024b')
+sha256sums=('@SOURCE_SHA256@' 'f7ef3ae8a22e521f289803fe93543eb64c329b58aa73a9e224dfd915a2a5f4f7' 'SKIP')
+
+build() {
+  cmake -S "${srcdir}/ibus-wetypex-${pkgver}" -B "${srcdir}/build" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_LIBDIR=lib -DWETYPE_LAYER_SHELL=ON \
+    -DFETCHCONTENT_SOURCE_DIR_KQUEUE="${srcdir}/libkqueue" \
+    -DFETCHCONTENT_SOURCE_DIR_WETYPEX_CURL="${srcdir}/curl-8.22.0"
+  cmake --build "${srcdir}/build" --parallel
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install "${srcdir}/build"
+  install -Dm644 "${srcdir}/ibus-wetypex-${pkgver}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${srcdir}/ibus-wetypex-${pkgver}/NOTICE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/NOTICE"
+  install -Dm644 "${srcdir}/ibus-wetypex-${pkgver}/README.md" \
+    "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+}

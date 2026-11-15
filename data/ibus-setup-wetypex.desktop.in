@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=WeTypeX Settings
+Name[zh_CN]=WeTypeX 设置
+Comment=Configure the WeTypeX input method
+Comment[zh_CN]=配置 WeTypeX 输入法
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/wetypex-settings
+Icon=wetypex
+Categories=Settings;Utility;
+StartupNotify=true
+StartupWMClass=wetypex-settings
