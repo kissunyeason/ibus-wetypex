@@ -140,6 +140,10 @@ struct EngineState {
   uint64_t voiceSession = 0;
   uint64_t voiceEpoch = 0;
   std::string voiceToken;
+  // 按住空格说话：短按仍是普通空格，按住越过阈值才启动录音。
+  bool voiceSpaceDown = false;
+  guint voiceSpaceSource = 0;
+  guint voiceSpaceKeycode = 0;
   bool selectionPending = false;
   bool renderedPreeditVisible = false;
   bool renderedPreeditInitialized = false;
@@ -884,6 +888,11 @@ static void clearVoice(EngineState *state) {
     g_source_remove(state->voiceSource);
     state->voiceSource = 0;
   }
+  if (state->voiceSpaceSource) {
+    g_source_remove(state->voiceSpaceSource);
+    state->voiceSpaceSource = 0;
+  }
+  state->voiceSpaceDown = false;
   state->voiceActive = false;
   state->voiceFinishing = false;
   state->voiceToken.clear();
@@ -981,12 +990,61 @@ static gboolean voiceTick(gpointer data) {
   voiceAux(state, text.empty() ? "🎤 语音输入中…" : "🎤 " + text);
   return TRUE;
 }
+
+// 按住空格越过阈值才启动语音，避免把普通打空格变成录音。
+static gboolean voiceSpaceHold(gpointer data) {
+  auto *state = static_cast<EngineState *>(data);
+  state->voiceSpaceSource = 0;
+  if (!state->voiceSpaceDown || !state->preedit.empty() || !state->candidates.empty() ||
+      state->english || !state->active)
+    return FALSE;
+  startVoice(state);
+  return FALSE;
+}
+
+// 短按：把被吞掉的 keydown/keyup 成对转发回应用，等价于一个普通空格。
+static void forwardPlainSpace(IBusEngine *engine, guint keycode) {
+  ibus_engine_forward_key_event(engine, IBUS_KEY_space, keycode, 0);
+  ibus_engine_forward_key_event(engine, IBUS_KEY_space, keycode, IBUS_RELEASE_MASK);
+}
 // ---- 语音输入最小接线结束 ---------------------------------------------
 
 gboolean onProcessKey(IBusEngine *engine, guint keyval, guint keycode, guint modifiers) {
   auto *state = reinterpret_cast<WeTypeEngine *>(engine)->state;
   const bool release = (modifiers & IBUS_RELEASE_MASK) != 0;
   const guint cleanModifiers = modifiers & ~IBUS_RELEASE_MASK;
+
+  // 按住空格说话（push-to-talk）：仅在无组合输入、无候选、非英文模式时接管。
+  // 短按（<160 ms）转发成普通空格；按住越过阈值才录音，松开自动结束并上屏。
+  // 排除 CapsLock/NumLock 等锁定态位，避免开了大写就用不了。
+  const guint reservedMods =
+      cleanModifiers & ~(IBUS_LOCK_MASK | IBUS_MOD2_MASK | IBUS_HANDLED_MASK | IBUS_IGNORED_MASK);
+  if (keyval == IBUS_KEY_space && reservedMods == 0 && state->active && !state->english &&
+      state->preedit.empty() && state->candidates.empty() && !state->selectionPending) {
+    if (release) {
+      if (!state->voiceSpaceDown)
+        return FALSE;
+      state->voiceSpaceDown = false;
+      if (state->voiceSpaceSource) {
+        g_source_remove(state->voiceSpaceSource);
+        state->voiceSpaceSource = 0;
+        forwardPlainSpace(engine, state->voiceSpaceKeycode);
+        return TRUE;
+      }
+      if (state->voiceActive && !state->voiceFinishing) {
+        state->voiceFinishing = true;
+        spawnVoiceControl({"finish", state->voiceToken});
+        voiceAux(state, "🎤 识别中…");
+      }
+      return TRUE;
+    }
+    if (state->voiceSpaceDown)
+      return TRUE;  // 忽略按键重复
+    state->voiceSpaceDown = true;
+    state->voiceSpaceKeycode = keycode;
+    state->voiceSpaceSource = g_timeout_add(160, voiceSpaceHold, state);
+    return TRUE;
+  }
 
   // 语音输入开关：Ctrl+Alt+V。必须放在 isCommandModifier 之前，
   // 否则带修饰键的组合会被当作命令键直接放行给应用。
@@ -1130,16 +1188,24 @@ gboolean onProcessKey(IBusEngine *engine, guint keyval, guint keycode, guint mod
       return TRUE;
     }
 
-    if (keyval == IBUS_KEY_Page_Up || keyval == IBUS_KEY_Page_Down) {
+    // 候选翻页：PageUp/PageDown 以及 - / =。翻不动时 - / = 放行为普通字符。
+    const bool pagePrev = keyval == IBUS_KEY_Page_Up || keyval == IBUS_KEY_minus;
+    const bool pageNext = keyval == IBUS_KEY_Page_Down || keyval == IBUS_KEY_equal;
+    if (pagePrev || pageNext) {
       const int pageCount =
           static_cast<int>((state->candidates.size() + state->settings.pageSize - 1) / state->settings.pageSize);
       if (pageCount > 1) {
-        state->candidatePage =
-            std::clamp(state->candidatePage + (keyval == IBUS_KEY_Page_Down ? 1 : -1), 0, pageCount - 1);
-        state->candidateCursor = state->candidatePage * state->settings.pageSize;
-        updateUi(state);
+        const int nextPage =
+            std::clamp(state->candidatePage + (pageNext ? 1 : -1), 0, pageCount - 1);
+        if (nextPage != state->candidatePage) {
+          state->candidatePage = nextPage;
+          state->candidateCursor = state->candidatePage * state->settings.pageSize;
+          updateUi(state);
+          return TRUE;
+        }
       }
-      return TRUE;
+      if (keyval == IBUS_KEY_Page_Up || keyval == IBUS_KEY_Page_Down)
+        return TRUE;
     }
 
     if (keyval == IBUS_KEY_Up || keyval == IBUS_KEY_Down) {
