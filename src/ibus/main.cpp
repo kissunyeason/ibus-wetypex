@@ -140,10 +140,10 @@ struct EngineState {
   uint64_t voiceSession = 0;
   uint64_t voiceEpoch = 0;
   std::string voiceToken;
-  // 按住空格说话：短按仍是普通空格，按住越过阈值才启动录音。
-  bool voiceSpaceDown = false;
-  guint voiceSpaceSource = 0;
-  guint voiceSpaceKeycode = 0;
+  // Ctrl+空格语音（Windows 体验）：按住说话松手结束 / 短按免提按任意键结束。
+  bool voiceChordDown = false;
+  guint voiceChordSource = 0;
+  bool voiceHandsFree = false;
   bool selectionPending = false;
   bool renderedPreeditVisible = false;
   bool renderedPreeditInitialized = false;
@@ -888,11 +888,12 @@ static void clearVoice(EngineState *state) {
     g_source_remove(state->voiceSource);
     state->voiceSource = 0;
   }
-  if (state->voiceSpaceSource) {
-    g_source_remove(state->voiceSpaceSource);
-    state->voiceSpaceSource = 0;
+  if (state->voiceChordSource) {
+    g_source_remove(state->voiceChordSource);
+    state->voiceChordSource = 0;
   }
-  state->voiceSpaceDown = false;
+  state->voiceChordDown = false;
+  state->voiceHandsFree = false;
   state->voiceActive = false;
   state->voiceFinishing = false;
   state->voiceToken.clear();
@@ -991,21 +992,20 @@ static gboolean voiceTick(gpointer data) {
   return TRUE;
 }
 
-// 按住空格越过阈值才启动语音，避免把普通打空格变成录音。
-static gboolean voiceSpaceHold(gpointer data) {
+// 按住 Ctrl+空格：按下即开始录音（不丢语音开头）。200 ms 内松手视为短按，
+// 转为免提模式；超过 200 ms 则松手即结束（Windows「按住说话」）。
+static gboolean voiceChordHold(gpointer data) {
   auto *state = static_cast<EngineState *>(data);
-  state->voiceSpaceSource = 0;
-  if (!state->voiceSpaceDown || !state->preedit.empty() || !state->candidates.empty() ||
-      state->english || !state->active)
-    return FALSE;
-  startVoice(state);
+  state->voiceChordSource = 0;  // 定时器已触发 = 长按，松手要结束
   return FALSE;
 }
 
-// 短按：把被吞掉的 keydown/keyup 成对转发回应用，等价于一个普通空格。
-static void forwardPlainSpace(IBusEngine *engine, guint keycode) {
-  ibus_engine_forward_key_event(engine, IBUS_KEY_space, keycode, 0);
-  ibus_engine_forward_key_event(engine, IBUS_KEY_space, keycode, IBUS_RELEASE_MASK);
+static void finishVoiceChord(EngineState *state) {
+  if (state->voiceActive && !state->voiceFinishing) {
+    state->voiceFinishing = true;
+    spawnVoiceControl({"finish", state->voiceToken});
+    voiceAux(state, "🎤 识别中…");
+  }
 }
 // ---- 语音输入最小接线结束 ---------------------------------------------
 
@@ -1014,37 +1014,61 @@ gboolean onProcessKey(IBusEngine *engine, guint keyval, guint keycode, guint mod
   const bool release = (modifiers & IBUS_RELEASE_MASK) != 0;
   const guint cleanModifiers = modifiers & ~IBUS_RELEASE_MASK;
 
-  // 按住空格说话（push-to-talk）：仅在无组合输入、无候选、非英文模式时接管。
-  // 短按（<160 ms）转发成普通空格；按住越过阈值才录音，松开自动结束并上屏。
-  // 排除 CapsLock/NumLock 等锁定态位，避免开了大写就用不了。
-  const guint reservedMods =
+  // ---- Ctrl+空格语音输入（与 Windows 微信输入法一致）----
+  // 按住说话：按住组合键一直输入，松手结束并自动上屏。
+  // 免提模式：短按（<200 ms）松手后保持录音，按任意键结束。
+  // 排除 CapsLock/NumLock 等锁定态位；组合键首键 Ctrl 为修饰键。
+  const guint chordMods =
       cleanModifiers & ~(IBUS_LOCK_MASK | IBUS_MOD2_MASK | IBUS_HANDLED_MASK | IBUS_IGNORED_MASK);
-  if (keyval == IBUS_KEY_space && reservedMods == 0 && state->active && !state->english &&
-      state->preedit.empty() && state->candidates.empty() && !state->selectionPending) {
-    if (release) {
-      if (!state->voiceSpaceDown)
-        return FALSE;
-      state->voiceSpaceDown = false;
-      if (state->voiceSpaceSource) {
-        g_source_remove(state->voiceSpaceSource);
-        state->voiceSpaceSource = 0;
-        forwardPlainSpace(engine, state->voiceSpaceKeycode);
-        return TRUE;
-      }
-      if (state->voiceActive && !state->voiceFinishing) {
-        state->voiceFinishing = true;
-        spawnVoiceControl({"finish", state->voiceToken});
-        voiceAux(state, "🎤 识别中…");
-      }
-      return TRUE;
+  const bool ctrlSpaceKey = keyval == IBUS_KEY_space &&
+      (chordMods & IBUS_CONTROL_MASK) != 0 && (chordMods & ~IBUS_CONTROL_MASK) == 0;
+
+  // 松开组合键中的任意一键即算「松手」：先松 Ctrl 还是先松空格都能结束。
+  // 只吞掉空格的 release，修饰键 release 必须放行，否则客户端修饰键状态会卡住。
+  if (release && state->voiceChordDown) {
+    const bool swallow = keyval == IBUS_KEY_space;
+    state->voiceChordDown = false;
+    if (state->voiceChordSource) {
+      g_source_remove(state->voiceChordSource);
+      state->voiceChordSource = 0;
+      state->voiceHandsFree = true;
+      voiceAux(state, "🎤 免提语音输入中…（按任意键结束）");
+    } else {
+      finishVoiceChord(state);
     }
-    if (state->voiceSpaceDown)
-      return TRUE;  // 忽略按键重复
-    state->voiceSpaceDown = true;
-    state->voiceSpaceKeycode = keycode;
-    state->voiceSpaceSource = g_timeout_add(160, voiceSpaceHold, state);
+    return swallow ? TRUE : FALSE;
+  }
+
+  // 免提模式：按任意键结束（该键被吞掉，与 Windows「按任意键均可结束」一致）。
+  if (!release && state->voiceHandsFree) {
+    finishVoiceChord(state);
+    state->voiceHandsFree = false;
     return TRUE;
   }
+
+  if (ctrlSpaceKey && !release) {
+    if (state->voiceChordDown)
+      return TRUE;  // 忽略按键重复
+    if (state->voiceActive) {  // 已在录音：再按一次结束（兼容切换式）
+      finishVoiceChord(state);
+      return TRUE;
+    }
+    // 有组合输入/候选/英文模式时不抢 Ctrl+空格，避免破坏正常输入。
+    if (!state->active || state->english || !state->preedit.empty() ||
+        !state->candidates.empty() || state->selectionPending)
+      return FALSE;
+    state->voiceChordDown = true;
+    state->voiceHandsFree = false;
+    startVoice(state);
+    if (!state->voiceActive) {  // 启动器 spawn 失败
+      state->voiceChordDown = false;
+      return TRUE;
+    }
+    voiceAux(state, "🎤 语音输入中…（松手结束）");
+    state->voiceChordSource = g_timeout_add(200, voiceChordHold, state);
+    return TRUE;
+  }
+  // ---- Ctrl+空格语音输入结束 ----
 
   // 语音输入开关：Ctrl+Alt+V。必须放在 isCommandModifier 之前，
   // 否则带修饰键的组合会被当作命令键直接放行给应用。
